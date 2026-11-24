@@ -1,0 +1,14 @@
+[project]
+name = "bib-builder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "mistralai>=3.8.0",
+    "ollama>=0.6.3",
+    "pydantic>=2.14.4",
+    "pymupdf>=2.1",
+    "requests>=2.34.2",
+]
