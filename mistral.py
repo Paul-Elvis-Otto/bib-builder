@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import secrets
+from urllib.parse import urlparse
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -297,7 +299,13 @@ def canonical(entry, match):
     if not work:
         return entry
     biblio = work.get("biblio") or {}
-    source = ((work.get("primary_location") or {}).get("source") or {}).get("display_name")
+    location_source = (work.get("primary_location") or {}).get("source") or {}
+    source = location_source.get("display_name") if location_source.get("type") != "repository" else None
+    if work.get("type") in ("book-chapter", "conference-paper"):
+        parent = work.get("volume") or {}
+        source = parent.get("display_name") or parent.get("title") or entry.source
+    elif work.get("type") == "book":
+        source = entry.source
     pages = "-".join(str(p) for p in [biblio.get("first_page"), biblio.get("last_page")] if p)
     return entry.model_copy(update={
         "title": work.get("title") or entry.title,
@@ -308,10 +316,128 @@ def canonical(entry, match):
         "issue": biblio.get("issue") or entry.issue, "pages": pages or entry.pages})
 
 
+def export_records(entries, matches):
+    records = []
+    for index, (entry, match) in enumerate(zip(entries, matches), 1):
+        work = match.get("work") or {}
+        source = (work.get("primary_location") or {}).get("source") or {}
+        kind = work.get("type")
+        bibtype = {"book": "book", "book-chapter": "incollection",
+                   "conference-paper": "inproceedings"}.get(kind, "misc")
+        if kind in ("article", "review", "book-review", "letter", "editorial", "erratum", "data-paper") and source.get("type") == "journal":
+            bibtype = "article"
+        fields = {"author": " and ".join(studio.bib_escape(a) for a in entry.authors),
+                  "title": "{" + studio.bib_escape(entry.title) + "}",
+                  "year": str(entry.year) if entry.year else ""}
+        if bibtype == "article":
+            fields["journal"] = studio.bib_escape(source.get("display_name") or entry.source)
+        elif bibtype in ("incollection", "inproceedings"):
+            parent = work.get("volume") or {}
+            fields["booktitle"] = studio.bib_escape(parent.get("display_name") or parent.get("title") or entry.source)
+        elif bibtype == "misc":
+            fields["howpublished"] = studio.bib_escape(entry.source)
+        if bibtype in ("book", "incollection", "inproceedings"):
+            publisher = source.get("host_organization_name") if re.fullmatch(r"https://openalex.org/P\d+", source.get("host_organization") or "") else None
+            if not publisher and bibtype == "book" and entry.source != entry.title:
+                publisher = entry.source
+            if publisher:
+                fields["publisher"] = studio.bib_escape(publisher)
+        for field, value in (("volume", entry.volume), ("number", entry.issue),
+                             ("pages", re.sub(r"[-–—]+", "--", entry.pages) if entry.pages else None),
+                             ("doi", entry.doi), ("isbn", entry.isbn)):
+            if value:
+                fields[field] = studio.bib_escape(value)
+        if work.get("id"):
+            fields["url"] = studio.bib_escape(work["id"])
+        stem = re.sub(r"[^a-zA-Z0-9]", "", entry.authors[0] if entry.authors else "reference")[:32] or "reference"
+        body = ",\n".join(f"  {key} = {{{value}}}" for key, value in fields.items() if value)
+        records.append(f"@{bibtype}{{{stem}{entry.year or 'nd'}_{index},\n{body}\n}}")
+    return records
+
+
+def refresh_result(result):
+    entries = [canonical(BibEntry.model_validate(e), m) for e, m in zip(result["original_entries"], result["matches"])]
+    result["entries"] = [e.model_dump() for e in entries]
+    result["bibtex_records"] = export_records(entries, result["matches"])
+    result["bibtex"] = "\n\n".join(result["bibtex_records"]) + "\n"
+    counts = {"total": len(entries), "automatic": 0, "confirmed": 0, "unresolved": 0, "errors": 0}
+    for match in result["matches"]:
+        key = "confirmed" if match.get("decision") == "manual" and match.get("work") else "automatic" if match.get("work") else "errors" if match.get("status") == "error" else "unresolved"
+        counts[key] += 1
+    counts["identified"] = counts["automatic"] + counts["confirmed"]
+    result["counts"] = counts
+    return result
+
+
+def record_run(db, fingerprint, result, run_id=None, created=None):
+    result = refresh_result(result)
+    result["run_id"] = run_id or secrets.token_hex(24)
+    result["created"] = created if created is not None else time.time()
+    result["fingerprint"] = fingerprint
+    db.execute("INSERT OR IGNORE INTO runs VALUES(?,?,?,?)", (result["run_id"], fingerprint, result["created"], json.dumps(result)))
+    return result
+
+
+def import_legacy_runs(db):
+    for fingerprint, paper_id, metadata in db.execute("SELECT sha256,paper_id,metadata_json FROM documents WHERE sha256 NOT IN (SELECT fingerprint FROM runs)").fetchall():
+        rows = db.execute("SELECT original_json,match_json FROM citations WHERE document_sha256=? ORDER BY position", (fingerprint,)).fetchall()
+        work = db.execute("SELECT openalex_json FROM papers WHERE id=?", (paper_id,)).fetchone()
+        selected = json.loads(work[0]) if work and work[0] else None
+        record_run(db, fingerprint, {"paper": json.loads(metadata), "paper_id": paper_id,
+            "paper_match": {"status": "matched" if selected else "unresolved", "work": selected,
+                            "candidates": [{"work": selected}] if selected else []},
+            "original_entries": [json.loads(r[0]) for r in rows], "matches": [json.loads(r[1]) for r in rows],
+            "reference_pages": [], "legacy": True}, run_id="legacy-" + fingerprint, created=0)
+
+
+def load_run(db, run_id):
+    row = db.execute("SELECT result_json FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        raise ValueError("Saved run not found.")
+    return refresh_result(json.loads(row[0]))
+
+
+def choose_match(db, run_id, index, work_id):
+    result = load_run(db, run_id)
+    if type(index) is not int or not -1 <= index < len(result["matches"]):
+        raise ValueError("Invalid citation index.")
+    match = result["paper_match"] if index == -1 else result["matches"][index]
+    candidates = [c["work"] for c in match.get("candidates", [])]
+    if match.get("work") and all(w["id"] != match["work"]["id"] for w in candidates):
+        candidates.append(match["work"])
+    work = next((w for w in candidates if w["id"] == work_id), None)
+    if work_id is not None and work is None:
+        raise ValueError("Choose one of this citation's saved candidates.")
+    match.update(status="matched" if work else "unresolved", work=work, decision="manual" if work else "rejected",
+                 message="Selected by you" if work else "Left unresolved by you", reviewed_at=time.time())
+    result = refresh_result(result)
+    db.execute("UPDATE runs SET result_json=? WHERE id=?", (json.dumps(result), run_id))
+    latest = db.execute("SELECT id FROM runs WHERE fingerprint=? ORDER BY created DESC,id DESC LIMIT 1", (result["fingerprint"],)).fetchone()[0]
+    # The graph represents the latest run of a document; older snapshots remain independently reviewable.
+    if latest == run_id:
+        original = result["paper"] if index == -1 else result["original_entries"][index]
+        metadata = dict(original) if index == -1 else canonical(BibEntry.model_validate(original), match).model_dump()
+        if index == -1 and work:
+            metadata.update(title=work.get("title") or metadata["title"])
+        identity = work["id"] if work else ("pdf:" + result["fingerprint"] if index == -1 else f"unresolved:{result['fingerprint']}:{index}")
+        db.execute("INSERT INTO papers(identity,title,metadata_json,openalex_json) VALUES(?,?,?,?) ON CONFLICT(identity) DO UPDATE SET title=excluded.title,metadata_json=excluded.metadata_json,openalex_json=excluded.openalex_json",
+                   (identity, metadata["title"], json.dumps(metadata), json.dumps(work) if work else None))
+        paper_id = db.execute("SELECT id FROM papers WHERE identity=?", (identity,)).fetchone()[0]
+        if index == -1:
+            result["paper_id"] = paper_id
+            db.execute("UPDATE runs SET result_json=? WHERE id=?", (json.dumps(result), run_id))
+            db.execute("UPDATE documents SET paper_id=? WHERE sha256=?", (paper_id, result["fingerprint"]))
+            db.execute("UPDATE citations SET citing_id=? WHERE document_sha256=?", (paper_id, result["fingerprint"]))
+        else:
+            db.execute("UPDATE citations SET cited_id=?,match_json=? WHERE document_sha256=? AND position=?", (paper_id, json.dumps(match), result["fingerprint"], index))
+    return result
+
+
 def connect_db(path):
     db = sqlite3.connect(path, timeout=30)
     db.execute("PRAGMA foreign_keys = ON")
     db.executescript("""
+        CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, created REAL NOT NULL, result_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS api_cache (key TEXT PRIMARY KEY, response TEXT NOT NULL, expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS papers (
           id INTEGER PRIMARY KEY, identity TEXT NOT NULL UNIQUE,
@@ -468,10 +594,16 @@ def analyze(pdf_bytes, pages=None, exclusions=None, progress=lambda message: Non
             alex.session.close()
         enriched = [canonical(e, m) for e, m in zip(entries, matches)]
         paper_id = save_analysis(DB_PATH, hashlib.sha256(pdf_bytes).hexdigest(), paper, paper_match, entries, matches, reference)
-        return {"paper": paper.model_dump(), "paper_id": paper_id, "paper_match": paper_match,
+        result = {"paper": paper.model_dump(), "paper_id": paper_id, "paper_match": paper_match,
                 "entries": [e.model_dump() for e in enriched], "original_entries": [e.model_dump() for e in entries],
                 "matches": matches, "reference_pages": [p+1 for p, _ in sections],
                 "bibtex": studio.to_bibtex(enriched), "bibtex_records": studio.bibtex_records(enriched)}
+        db = connect_db(DB_PATH)
+        try:
+            with db:
+                return record_run(db, hashlib.sha256(pdf_bytes).hexdigest(), result)
+        finally:
+            db.close()
     finally:
         client.__exit__(None, None, None)
 
@@ -527,7 +659,82 @@ def run_extraction(job_id, pdf, pages, exclusions=None):
 
 
 class Handler(studio.Handler):
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/choose-match":
+            return super().do_POST()
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc != self.headers.get("Host"):
+            return self.json(403, {"error": "Cross-origin requests are not allowed."})
+        if self.headers.get_content_type() != "application/json":
+            return self.json(415, {"error": "Send application/json."})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 16384:
+                raise ValueError("Invalid request size.")
+            self.connection.settimeout(60)
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict) or not isinstance(data.get("run_id"), str) or "work_id" not in data:
+                raise ValueError("Provide run_id, index and work_id (null to leave unresolved).")
+            db = connect_db(DB_PATH)
+            try:
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    result = choose_match(db, data["run_id"], data.get("index"), data["work_id"])
+            finally:
+                db.close()
+            LOG.info("Run %s citation %s selection saved", data["run_id"], data.get("index"))
+            return self.json(200, result)
+        except (ValueError, TypeError) as exc:
+            return self.json(400, {"error": str(exc)})
+        except TimeoutError:
+            return self.json(408, {"error": "Request timed out."})
+
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ("/history", "/review.js"):
+            filename = "review.html" if path == "/history" else "review.js"
+            mime = "text/html" if path == "/history" else "text/javascript"
+            return self.respond(200, Path(__file__).with_name(filename).read_bytes(), mime + "; charset=utf-8")
+        if path == "/api/runs" or path.startswith("/api/runs/"):
+            db = connect_db(DB_PATH)
+            try:
+                with db:
+                    import_legacy_runs(db)
+                if path == "/api/runs":
+                    runs = []
+                    for (payload,) in db.execute("SELECT result_json FROM runs ORDER BY created DESC,id DESC"):
+                        result = refresh_result(json.loads(payload))
+                        runs.append({key: result[key] for key in ("run_id", "created", "paper", "counts")})
+                    return self.json(200, {"runs": runs})
+                parts = path.removeprefix("/api/runs/").split("/")
+                result = load_run(db, parts[0])
+                if len(parts) == 1:
+                    return self.json(200, result)
+                if len(parts) == 2 and parts[1] in ("bibtex", "ris"):
+                    ris = parts[1] == "ris"
+                    content = studio.to_ris([BibEntry.model_validate(e) for e in result["entries"]]) if ris else result["bibtex"]
+                    return self.respond(200, content.encode(), "text/plain; charset=utf-8", "bibliography.ris" if ris else "bibliography.bib")
+                return self.json(404, {"error": "Not found."})
+            except ValueError as exc:
+                return self.json(404, {"error": str(exc)})
+            finally:
+                db.close()
+        match = re.fullmatch(r"/api/(jobs|download)/([a-f0-9]+)(?:/(bibtex|ris))?", path)
+        if match:
+            with studio.LOCK:
+                job = studio.JOBS.get(match[2], {}).copy()
+            if job.get("run_id"):
+                db = connect_db(DB_PATH)
+                try:
+                    result = load_run(db, job["run_id"])
+                finally:
+                    db.close()
+                if match[1] == "jobs":
+                    return self.json(200, {**job, **result})
+                if match[3]:
+                    ris = match[3] == "ris"
+                    content = studio.to_ris([BibEntry.model_validate(e) for e in result["entries"]]) if ris else result["bibtex"]
+                    return self.respond(200, content.encode(), "text/plain; charset=utf-8", "bibliography.ris" if ris else "bibliography.bib")
         if self.path.split("?", 1)[0] == "/api/graph":
             db = connect_db(DB_PATH)
             try:
@@ -549,7 +756,8 @@ def configure_web():
     studio.run_extraction = run_extraction
     studio.MODEL = "Mistral + OpenAlex"
     studio.HTML = studio.HTML.replace("Bibliography Studio", "Mistral Citation Studio")
-    studio.HTML = studio.HTML.replace('</header>', '<p><a href="/api/graph" target="_blank" rel="noopener">View saved citation graph (JSON)</a></p></header>')
+    studio.HTML = studio.HTML.replace('</style>', '.candidate-card{border-left:3px solid #a6c7df;padding:12px;margin:12px 0;background:#f5f9fc}.candidate-card h4{margin:0}#identificationSummary progress{width:100%}</style>')
+    studio.HTML = studio.HTML.replace('</header>', '<p><a href="/history">Previous runs &amp; review matches</a> · <a href="/api/graph" target="_blank" rel="noopener">View saved citation graph (JSON)</a></p></header>')
     studio.HTML = studio.HTML.replace('placeholder="e.g. 12-15, 18"', 'placeholder="auto, or e.g. 12-15, 18"')
     studio.HTML = studio.HTML.replace("Select pages in the numbered preview, or enter PDF page positions here (starting at 1). Only selected pages are sent to the model.",
         "Leave blank for automatic reference detection, or select reference pages. Paper identification starts with page one and expands only if needed. Automatic mode tries likely reference pages first, then scans the full PDF if no references are extracted. Citation metadata is sent to OpenAlex and saved locally in SQLite.")
@@ -559,9 +767,12 @@ def configure_web():
     studio.HTML = studio.HTML.replace('<p id="status"', '<progress id="jobProgress" max="100" value="0" aria-label="Extraction progress" style="width:100%"></progress><p id="progressLabel" class="muted">Waiting to start</p><p id="status"')
     studio.HTML = studio.HTML.replace('status(data.message);if(data.status', "status(data.message);$('jobProgress').value=data.progress||0;$('progressLabel').textContent=data.status==='error'?'Stopped: extraction failed':data.status==='done'?'Complete':`${data.progress||0}% · estimated progress`;if(data.status")
     studio.HTML = studio.HTML.replace("clearResults();busy(true);status('Queuing extraction…')", "clearResults();$('jobProgress').value=0;$('progressLabel').textContent='Queued';busy(true);status('Queuing extraction…')")
+    studio.HTML = studio.HTML.replace('<script>', '<script src="/review.js"></script><script>', 1)
+    studio.HTML = studio.HTML.replace("function showResults(data,id){", "function showResults(data,id){showIdentificationSummary(data);")
     studio.HTML = studio.HTML.replace("Original reference · not verified", "Original printed reference")
     studio.HTML = studio.HTML.replace("const review=makeGeminiReview(id,index);", """
         const match=data.matches?.[index];
+        if(data.run_id)item.append(candidatePicker(data,index,updated=>showResults(updated,id)));
         const evidence=document.createElement('p');
         evidence.textContent='OpenAlex: '+(match?.status||'unresolved')+' · '+(match?.message||'');
         if(match?.work){const link=document.createElement('a');link.href=match.work.id;link.textContent=' · View matched work';link.target='_blank';link.rel='noopener';evidence.append(link);}
@@ -582,6 +793,12 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("bibliography.json"))
     args = parser.parse_args()
     DB_PATH = args.database
+    db = connect_db(DB_PATH)
+    try:
+        with db:
+            import_legacy_runs(db)
+    finally:
+        db.close()
     if args.pdf:
         data = args.pdf.read_bytes()
         if len(data) > studio.MAX_UPLOAD:

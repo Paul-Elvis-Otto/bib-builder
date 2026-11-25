@@ -1,0 +1,8 @@
+TODO: Fix naming format, currently author is just one field, needs to be last and first name
+TODO: One click markdown export
+TODO: extract from non papers
+TODO: properly integrate the UI
+FIX: page makes decision hard
+FIX: More view options
+TODO: Build this into apple container image
+

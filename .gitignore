@@ -9,3 +9,15 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Local citation database and extraction outputs
+*.sqlite3
+*.sqlite3-*
+bibliography.json
+bibliography.bib
+bibliography.ris
+bibliography_raw.md
+
+# Browser verification artifacts
+.playwright-cli/
+output/playwright/
