@@ -51,6 +51,7 @@ if(document.getElementById('historyView')){
     }
     function renderRun(data){selected=data;detail.hidden=false;detail.replaceChildren();detail.append(reviewNode('h2',data.paper.title),reviewNode('p',identificationText(data.counts)));
         const progress=reviewNode('progress');progress.max=data.counts.total||1;progress.value=data.counts.identified;progress.setAttribute('aria-label','Identified references');detail.append(progress);
+        addObsidianView(detail,data.entries,notice);
         const tools=reviewNode('div');tools.className='toolbar';
         for(const [format,label] of [['bibtex','Download BibTeX'],['ris','Download RIS']]){const link=reviewNode('a',label);link.href='/api/runs/'+encodeURIComponent(data.run_id)+'/'+format;tools.append(link);}
         const filter=reviewNode('select');filter.setAttribute('aria-label','Filter citations');for(const [value,label] of [['all','All citations'],['pending','Needs a decision'],['identified','Identified']]){const option=reviewNode('option',label);option.value=value;filter.append(option);}tools.append(filter);detail.append(tools);
@@ -68,3 +69,6 @@ if(document.getElementById('historyView')){
     window.addEventListener('hashchange',openHash);
     loadList().then(openHash).catch(e=>notice.textContent=e.message);
 }
+function obsidianLinks(entries){return entries.map(entry=>{const first=(entry.authors||[])[0]||'';const family=first.includes(',')?first.split(',',1)[0].trim():first.trim().split(/\s+/).filter(Boolean).at(-1)||'Unknown';const year=entry.year?String(entry.year):'nd';const title=String(entry.title||'Untitled').replace(/[\r\n]+/g,' ').trim();return `[[${family}${year}|${title}]]`;}).join('\n');}
+async function copyObsidian(entries,textarea,status){const value=obsidianLinks(entries);textarea.value=value;textarea.hidden=false;try{await navigator.clipboard.writeText(value);status.textContent='Obsidian links copied to clipboard.';}catch(_){textarea.focus();textarea.select();status.textContent='Links are selected below. Press Ctrl+C or Command+C to copy.';}}
+function addObsidianView(container,entries,status){const area=reviewNode('section');area.className='obsidian-export';const button=reviewNode('button','Copy Obsidian links');button.type='button';button.onclick=()=>copyObsidian(entries,textarea,status);const textarea=reviewNode('textarea');textarea.hidden=true;textarea.readOnly=true;textarea.setAttribute('aria-label','Obsidian links, one per line');area.append(button,textarea);container.append(area);}

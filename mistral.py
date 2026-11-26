@@ -109,6 +109,33 @@ def doi_key(value):
     return re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", value or "", flags=re.I).strip().casefold()
 
 
+def family_given(name):
+    """Normalize recognizable names to BibTeX's ``family, given`` convention."""
+    name = " ".join(str(name or "").strip().split())
+    if not name:
+        return name
+    if "," in name:
+        family, given = name.split(",", 1)
+        return f"{family.strip()}, {given.strip()}".rstrip(", ")
+    tokens = name.split()
+    if len(tokens) == 1:
+        return name
+    # Inverted bibliography forms: surname then initials (Abidin C, Smith J.).
+    if len(tokens) == 2 and re.fullmatch(r"(?:[A-Z]\.?){1,4}", tokens[1]):
+        initials = tokens[1].replace(".", "")
+        return f"{tokens[0]}, {' '.join(initials)}"
+    if tokens[0].isupper() and len(tokens[0]) > 1:
+        return f"{tokens[0]}, {' '.join(tokens[1:])}"
+    # Preserve particles with the family name and compound given names.
+    particles = {"da", "das", "de", "del", "della", "der", "di", "du", "la", "le", "van", "von"}
+    family_start = len(tokens) - 1
+    while family_start > 0 and tokens[family_start - 1].casefold() in particles:
+        family_start -= 1
+    family = " ".join(tokens[family_start:])
+    given = " ".join(tokens[:family_start])
+    return f"{family}, {given}"
+
+
 def author_surname(name):
     if "," in name:
         return normalized(name.split(",", 1)[0])
@@ -309,7 +336,7 @@ def canonical(entry, match):
     pages = "-".join(str(p) for p in [biblio.get("first_page"), biblio.get("last_page")] if p)
     return entry.model_copy(update={
         "title": work.get("title") or entry.title,
-        "authors": [a["author"]["display_name"] for a in work.get("authorships", [])] or entry.authors,
+        "authors": [family_given(a["author"]["display_name"]) for a in work.get("authorships", [])] or [family_given(a) for a in entry.authors],
         "year": work.get("publication_year") or entry.year,
         "doi": doi_key(work.get("doi")) or None,
         "source": source or entry.source, "volume": biblio.get("volume") or entry.volume,
@@ -326,7 +353,7 @@ def export_records(entries, matches):
                    "conference-paper": "inproceedings"}.get(kind, "misc")
         if kind in ("article", "review", "book-review", "letter", "editorial", "erratum", "data-paper") and source.get("type") == "journal":
             bibtype = "article"
-        fields = {"author": " and ".join(studio.bib_escape(a) for a in entry.authors),
+        fields = {"author": " and ".join(studio.bib_escape(family_given(a)) for a in entry.authors),
                   "title": "{" + studio.bib_escape(entry.title) + "}",
                   "year": str(entry.year) if entry.year else ""}
         if bibtype == "article":
@@ -691,9 +718,9 @@ class Handler(studio.Handler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/history", "/review.js"):
-            filename = "review.html" if path == "/history" else "review.js"
-            mime = "text/html" if path == "/history" else "text/javascript"
+        if path in ("/history", "/review.js", "/ui.css"):
+            filename = "review.html" if path == "/history" else "review.js" if path == "/review.js" else "ui.css"
+            mime = "text/html" if path == "/history" else "text/javascript" if path == "/review.js" else "text/css"
             return self.respond(200, Path(__file__).with_name(filename).read_bytes(), mime + "; charset=utf-8")
         if path == "/api/runs" or path.startswith("/api/runs/"):
             db = connect_db(DB_PATH)
@@ -756,6 +783,7 @@ def configure_web():
     studio.run_extraction = run_extraction
     studio.MODEL = "Mistral + OpenAlex"
     studio.HTML = studio.HTML.replace("Bibliography Studio", "Mistral Citation Studio")
+    studio.HTML = studio.HTML.replace("</style>", Path(__file__).with_name("ui.css").read_text() + "</style>", 1)
     studio.HTML = studio.HTML.replace('</style>', '.candidate-card{border-left:3px solid #a6c7df;padding:12px;margin:12px 0;background:#f5f9fc}.candidate-card h4{margin:0}#identificationSummary progress{width:100%}</style>')
     studio.HTML = studio.HTML.replace('</header>', '<p><a href="/history">Previous runs &amp; review matches</a> · <a href="/api/graph" target="_blank" rel="noopener">View saved citation graph (JSON)</a></p></header>')
     studio.HTML = studio.HTML.replace('placeholder="e.g. 12-15, 18"', 'placeholder="auto, or e.g. 12-15, 18"')

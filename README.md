@@ -169,3 +169,7 @@ a book series or repository is not substituted for it. Unknown publication types
 remain `@misc`. Author order, year, volume, issue (`number`), page ranges (`--`), DOI,
 and known publisher metadata are mapped into their respective fields. Missing
 metadata is not invented, and the original printed citation remains available.
+
+Click **Copy Obsidian links** in live results or a saved run to copy one wikilink
+per citation line, using `[[FirstAuthorLastNameYYYY|Paper title]]`. A visible
+textarea provides a manual-copy fallback. A citation without a year uses `nd`.

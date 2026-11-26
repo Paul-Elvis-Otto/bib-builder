@@ -41,6 +41,16 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("secret-api-key-and-document", message)
         self.assertIn("network", app.extraction_error(app.httpx.ConnectError("private URL")))
 
+    def test_family_given_names(self):
+        for name, expected in [('Jane Smith', 'Smith, Jane'), ('Jane Ann Smith', 'Smith, Jane Ann'),
+                               ('Abidin C', 'Abidin, C'), ('ABIDIN Crystal', 'ABIDIN, Crystal'),
+                               ('Smith, Jane Ann', 'Smith, Jane Ann'), ('Jean-Luc Picard', 'Picard, Jean-Luc'),
+                               ('Ludwig van Beethoven', 'van Beethoven, Ludwig'), ('Madonna', 'Madonna')]:
+            self.assertEqual(app.family_given(name), expected)
+        match = {'work': work()}
+        self.assertEqual(app.canonical(entry(), match).authors, ['Smith, Jane'])
+        self.assertIn('author = {Smith, Jane}', app.export_records([app.canonical(entry(), match)], [match])[0])
+
     def test_surname_initials_and_rejection_reasons(self):
         for name in ['Smith J', 'Smith J.', 'Smith JJ', 'Smith, Jane', 'Jane Smith']:
             e = entry().model_copy(update={'authors': [name]})
